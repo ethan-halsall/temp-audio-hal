@@ -46,6 +46,7 @@
 #include <pthread.h>
 #include <sys/resource.h>
 #include <unistd.h>
+#include <system/thread_defs.h>
 
 #include "audio_hw.h"
 #include "audio_extn.h"
@@ -602,6 +603,7 @@ int audio_extn_ffv_init_ec_ref_loopback(struct audio_device *adev,
     int param_size = 0;
     FfvStatusType status_type;
     int ret = 0;
+    ffv_quadrx_use_dwnmix_param_t quad_downmix;
 
     ALOGV("%s: entry", __func__);
     /* notify library to reset AEC during each start */
@@ -621,6 +623,20 @@ int audio_extn_ffv_init_ec_ref_loopback(struct audio_device *adev,
     uc_info_tx = (struct audio_usecase *)calloc(1, sizeof(struct audio_usecase));
     if (!uc_info_tx) {
         return -ENOMEM;
+    }
+
+    if (in_snd_device == SND_DEVICE_IN_EC_REF_LOOPBACK_QUAD) {
+        quad_downmix.quadrx_dwnmix_enable = true;
+        ALOGD("%s: set param for 4 ch ec, handle %p", __func__, ffvmod.handle);
+        status_type = ffv_set_param_fn(ffvmod.handle,
+            (char *)&quad_downmix,
+            FFV_QUADRX_USE_DWNMIX_PARAM,
+            sizeof(ffv_quadrx_use_dwnmix_param_t));
+        if (status_type) {
+            ALOGE("%s: ERROR. ffv_set_param_fn for quad channel ec ref %d",
+                __func__, status_type);
+            return -EINVAL;
+        }
     }
 
     pthread_mutex_lock(&ffvmod.init_lock);
@@ -778,6 +794,8 @@ int32_t audio_extn_ffv_read(struct audio_stream_in *stream __unused,
                 return status;
             }
         }
+        audio_extn_set_cpu_affinity();
+        setpriority(PRIO_PROCESS, 0, ANDROID_PRIORITY_AUDIO);
         ffvmod.capture_started = true;
     }
 
@@ -905,7 +923,6 @@ void audio_extn_ffv_set_parameters(struct audio_device *adev __unused,
             str_parms_del(parms, AUDIO_PARAMETER_FFV_EC_REF_DEVICE);
         } else if (str_parms_get_int(parms, AUDIO_PARAMETER_DEVICE_CONNECT, &val) >= 0) {
             ret = 1;
-            str_parms_del(parms, AUDIO_PARAMETER_DEVICE_CONNECT);
         }
         if (ret == 1) {
             if (val & AUDIO_DEVICE_OUT_SPEAKER) {
@@ -921,7 +938,6 @@ void audio_extn_ffv_set_parameters(struct audio_device *adev __unused,
 
         ret = str_parms_get_int(parms, AUDIO_PARAMETER_DEVICE_DISCONNECT, &val);
         if (ret >= 0) {
-            str_parms_del(parms, AUDIO_PARAMETER_DEVICE_DISCONNECT);
             if (val & AUDIO_DEVICE_OUT_LINE) {
                 ALOGD("%s: capture ec ref from speaker", __func__);
                 ffvmod.ec_ref_dev = AUDIO_DEVICE_OUT_SPEAKER;

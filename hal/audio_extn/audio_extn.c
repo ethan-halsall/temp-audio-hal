@@ -46,7 +46,7 @@
 #include <cutils/properties.h>
 #include <cutils/log.h>
 #include <unistd.h>
-
+#include <sched.h>
 #include "audio_hw.h"
 #include "audio_extn.h"
 #include "audio_defs.h"
@@ -60,6 +60,16 @@
 #include <log_xml_parser.h>
 #define LOG_MASK HAL_MOD_FILE_AUDIO_EXTN
 #include <log_utils.h>
+#endif
+
+#ifndef APTX_DECODER_ENABLED
+#define audio_extn_aptx_dec_set_license(adev) (0)
+#define audio_extn_set_aptx_dec_bt_addr(adev, parms) (0)
+#define audio_extn_parse_aptx_dec_bt_addr(value) (0)
+#else
+static void audio_extn_aptx_dec_set_license(struct audio_device *adev);
+static void audio_extn_set_aptx_dec_bt_addr(struct audio_device *adev, struct str_parms *parms);
+static void audio_extn_parse_aptx_dec_bt_addr(char *value);
 #endif
 
 #define MAX_SLEEP_RETRY 100
@@ -595,6 +605,25 @@ void audio_extn_check_and_set_dts_hpx_state(const struct audio_device *adev)
 }
 #endif
 
+/* Affine AHAL thread to CPU core */
+void audio_extn_set_cpu_affinity()
+{
+    cpu_set_t cpuset;
+    struct sched_param sched_param;
+    int policy = SCHED_FIFO, rc = 0;
+
+    ALOGV("%s: Set CPU affinity for read thread", __func__);
+    CPU_ZERO(&cpuset);
+    if (sched_setaffinity(0, sizeof(cpuset), &cpuset) != 0)
+        ALOGE("%s: CPU Affinity allocation failed for Capture thread",
+               __func__);
+
+    sched_param.sched_priority = sched_get_priority_min(policy);
+    rc = sched_setscheduler(0, policy, &sched_param);
+    if (rc != 0)
+         ALOGE("%s: Failed to set realtime priority", __func__);
+}
+
 #ifdef HIFI_AUDIO_ENABLED
 bool audio_extn_is_hifi_audio_enabled(void)
 {
@@ -870,12 +899,17 @@ done:
 #define audio_extn_get_afe_proxy_parameters(adev, query, reply) (0)
 #else
 static int32_t afe_proxy_set_channel_mapping(struct audio_device *adev,
-                                                     int channel_count)
+                                                     int channel_count,
+                                                     snd_device_t snd_device)
 {
-    struct mixer_ctl *ctl;
+    struct mixer_ctl *ctl = NULL, *be_ctl = NULL;
     const char *mixer_ctl_name = "Playback Device Channel Map";
-    long set_values[8] = {0};
-    int ret;
+    const char *be_mixer_ctl_name = "Backend Device Channel Map";
+    long set_values[FCC_8] = {0};
+    long be_set_values[FCC_8 + 1] = {0};
+    int ret = -1;
+    int be_idx = -1;
+
     ALOGV("%s channel_count:%d",__func__, channel_count);
 
     switch (channel_count) {
@@ -907,21 +941,42 @@ static int32_t afe_proxy_set_channel_mapping(struct audio_device *adev,
         return -EINVAL;
     }
 
-    ctl = mixer_get_ctl_by_name(adev->mixer, mixer_ctl_name);
+    be_idx = platform_get_snd_device_backend_index(snd_device);
+
+    if (be_idx >= 0) {
+        be_ctl = mixer_get_ctl_by_name(adev->mixer, be_mixer_ctl_name);
+        if (!be_ctl) {
+            ALOGD("%s: Could not get ctl for mixer cmd - %s, using default control",
+                  __func__, be_mixer_ctl_name);
+            ctl = mixer_get_ctl_by_name(adev->mixer, mixer_ctl_name);
+        } else
+            ctl = be_ctl;
+    } else
+         ctl = mixer_get_ctl_by_name(adev->mixer, mixer_ctl_name);
+
     if (!ctl) {
         ALOGE("%s: Could not get ctl for mixer cmd - %s",
               __func__, mixer_ctl_name);
         return -EINVAL;
     }
+
     ALOGV("AFE: set mapping(%ld %ld %ld %ld %ld %ld %ld %ld) for channel:%d",
         set_values[0], set_values[1], set_values[2], set_values[3], set_values[4],
         set_values[5], set_values[6], set_values[7], channel_count);
-    ret = mixer_ctl_set_array(ctl, set_values, channel_count);
+
+    if (!be_ctl)
+        ret = mixer_ctl_set_array(ctl, set_values, channel_count);
+    else {
+       be_set_values[0] = be_idx;
+       memcpy(&be_set_values[1], set_values, sizeof(long) * channel_count);
+       ret = mixer_ctl_set_array(ctl, be_set_values, ARRAY_SIZE(be_set_values));
+    }
+
     return ret;
 }
 
 int32_t audio_extn_set_afe_proxy_channel_mixer(struct audio_device *adev,
-                                    int channel_count)
+                                    int channel_count, snd_device_t snd_device)
 {
     int32_t ret = 0;
     const char *channel_cnt_str = NULL;
@@ -954,7 +1009,7 @@ int32_t audio_extn_set_afe_proxy_channel_mixer(struct audio_device *adev,
     mixer_ctl_set_enum_by_string(ctl, channel_cnt_str);
 
     if (channel_count == 6 || channel_count == 8 || channel_count == 2) {
-        ret = afe_proxy_set_channel_mapping(adev, channel_count);
+        ret = afe_proxy_set_channel_mapping(adev, channel_count, snd_device);
     } else {
         ALOGE("%s: set unsupported channel count(%d)",  __func__, channel_count);
         ret = -EINVAL;
@@ -1538,7 +1593,6 @@ int audio_extn_check_and_set_multichannel_usecase(struct audio_device *adev,
 static void audio_extn_aptx_dec_set_license(struct audio_device *adev)
 {
     int ret, key = 0;
-    char value[128] = {0};
     struct mixer_ctl *ctl;
     const char *mixer_ctl_name = "APTX Dec License";
 
@@ -1556,7 +1610,7 @@ static void audio_extn_aptx_dec_set_license(struct audio_device *adev)
         ALOGE("%s: cannot set license, error:%d",__func__, ret);
 }
 
-static void audio_extn_set_aptx_dec_bt_addr(struct audio_device *adev, struct str_parms *parms)
+static void audio_extn_set_aptx_dec_bt_addr(struct audio_device *adev __unused, struct str_parms *parms)
 {
     int ret = 0;
     char value[256];
@@ -1575,6 +1629,7 @@ int audio_extn_set_aptx_dec_params(struct aptx_dec_param *payload)
     aextnmod.addr.nap = aptx_cfg->bt_addr.nap;
     aextnmod.addr.uap = aptx_cfg->bt_addr.uap;
     aextnmod.addr.lap = aptx_cfg->bt_addr.lap;
+    return 0;
 }
 
 static void audio_extn_parse_aptx_dec_bt_addr(char *value)
@@ -1602,11 +1657,7 @@ static void audio_extn_parse_aptx_dec_bt_addr(char *value)
 
 void audio_extn_send_aptx_dec_bt_addr_to_dsp(struct stream_out *out)
 {
-    char mixer_ctl_name[128];
-    struct mixer_ctl *ctl;
-    uint32_t addr[3];
-
-    ALOGV("%s", __func__);
+    ALOGD("%s", __func__);
     out->compr_config.codec->options.aptx_dec.nap = aextnmod.addr.nap;
     out->compr_config.codec->options.aptx_dec.uap = aextnmod.addr.uap;
     out->compr_config.codec->options.aptx_dec.lap = aextnmod.addr.lap;
